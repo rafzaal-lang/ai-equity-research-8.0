@@ -81,6 +81,22 @@ def test_individual_apis(ticker: str):
     except Exception as e:
         results["macro_fred"] = f"FAILED: {str(e)}"
     
+    # Test OpenAI API
+    try:
+        import openai
+        import os
+        openai.api_key = os.getenv('OPENAI_API_KEY')
+        
+        # Simple test call
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Test"}],
+            max_tokens=5
+        )
+        results["openai"] = "SUCCESS" if response else "NO_DATA"
+    except Exception as e:
+        results["openai"] = f"FAILED: {str(e)}"
+    
     # Test Financial Model
     try:
         model = build_model(ticker)
