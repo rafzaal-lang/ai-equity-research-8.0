@@ -62,6 +62,41 @@ def debug_apis():
         "sec_agent": os.getenv('SEC_USER_AGENT', 'MISSING')
     }
 
+# DEBUG ENDPOINT - Test individual APIs
+@app.get("/debug/test-apis/{ticker}")
+def test_individual_apis(ticker: str):
+    results = {}
+    
+    # Test FMP API
+    try:
+        hist = fmp.historical_prices(ticker, limit=5)
+        results["fmp_historical"] = "SUCCESS" if hist else "NO_DATA"
+    except Exception as e:
+        results["fmp_historical"] = f"FAILED: {str(e)}"
+    
+    # Test Macro (FRED)
+    try:
+        macro = macro_snapshot()
+        results["macro_fred"] = "SUCCESS" if macro else "NO_DATA"
+    except Exception as e:
+        results["macro_fred"] = f"FAILED: {str(e)}"
+    
+    # Test Financial Model
+    try:
+        model = build_model(ticker)
+        results["financial_model"] = "SUCCESS" if model and "error" not in model else "NO_DATA"
+    except Exception as e:
+        results["financial_model"] = f"FAILED: {str(e)}"
+    
+    # Test Comps
+    try:
+        comp = comps_table(ticker)
+        results["comps"] = "SUCCESS" if comp else "NO_DATA"
+    except Exception as e:
+        results["comps"] = f"FAILED: {str(e)}"
+    
+    return results
+
 @app.get("/v1/report/{ticker}", response_model=ReportResponse)
 def get_report(ticker: str):
     try:
