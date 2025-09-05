@@ -1,10 +1,9 @@
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
 from src.services.report.composer import compose
 from src.services.financial_modeler import build_model
 from src.services.macro.snapshot import macro_snapshot
@@ -18,9 +17,34 @@ class ReportResponse(BaseModel):
     symbol: str
     markdown: str
 
+# ROOT ENDPOINT - Fix for 404 on /
+@app.get("/")
+def root():
+    return {
+        "service": "AI Equity Research - Reports Service",
+        "version": "8.0",
+        "status": "healthy",
+        "endpoints": {
+            "health": "/v1/health",
+            "report": "/v1/report/{ticker}",
+            "metrics": "/metrics",
+            "docs": "/docs"
+        }
+    }
+
+# HEALTH CHECK ENDPOINTS - Fix for health check 404s
+@app.get("/health")
+def health_simple():
+    return {"status": "healthy"}
+
 @app.get("/v1/health")
 def health():
     return {"status": "healthy"}
+
+# FAVICON ENDPOINT - Fix for favicon.ico 404s
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)  # No content
 
 @app.get("/metrics")
 def metrics():
@@ -63,4 +87,3 @@ def get_report(ticker: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8086)
-
