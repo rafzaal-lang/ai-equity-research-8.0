@@ -50,6 +50,18 @@ def favicon():
 def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+# DEBUG ENDPOINT - Check API credentials
+@app.get("/debug/apis")
+def debug_apis():
+    import os
+    return {
+        "redis_url": "SET" if os.getenv('REDIS_URL') else "MISSING",
+        "fmp_key": "SET" if os.getenv('FMP_API_KEY') else "MISSING", 
+        "fred_key": "SET" if os.getenv('FRED_API_KEY') else "MISSING",
+        "openai_key": "SET" if os.getenv('OPENAI_API_KEY') else "MISSING",
+        "sec_agent": os.getenv('SEC_USER_AGENT', 'MISSING')
+    }
+
 @app.get("/v1/report/{ticker}", response_model=ReportResponse)
 def get_report(ticker: str):
     try:
