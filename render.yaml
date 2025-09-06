@@ -1,51 +1,19 @@
 services:
-  # 1) Managed Redis (Render Key Value)
-  - type: keyvalue
-    name: equity-redis
-    plan: starter
-    ipAllowList: []        # only internal connections
-
-  # 2) Qdrant as a private service (internal only)
-  - type: pserv
-    name: qdrant
-    runtime: image
-    image:
-      url: qdrant/qdrant:v1.8.3
-    plan: starter
-    disk:
-      name: qdrant-data
-      mountPath: /qdrant/storage
-      sizeGB: 10
-
-  # 3) Web UI built from your Dockerfile.ui
   - type: web
     name: equity-ui
     runtime: docker
-    plan: starter
     dockerfilePath: Dockerfile.ui
+    plan: free
     healthCheckPath: /
     envVars:
-      # Secrets: prompt once in dashboard (don’t hardcode values)
-      - key: OPENAI_API_KEY
-        sync: false
       - key: FMP_API_KEY
         sync: false
       - key: SEC_USER_AGENT
         sync: false
-
-      # Internal service wiring
-      - key: QDRANT_URL
-        value: http://qdrant:6333
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: equity-redis
-          property: connectionString
-
-      # Non-secrets
+      # Leave OPENAI_API_KEY unset to disable Retriever/Citations gracefully
+      - key: BASE_CURRENCY
+        value: USD
       - key: EMBED_MODEL
         value: text-embedding-3-large
       - key: EMBED_DIM
         value: "3072"
-      - key: BASE_CURRENCY
-        value: USD
