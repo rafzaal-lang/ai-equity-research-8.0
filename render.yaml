@@ -6,14 +6,20 @@ services:
     plan: free
     healthCheckPath: /
     envVars:
+      - key: OPENAI_API_KEY
+        sync: false
       - key: FMP_API_KEY
         sync: false
       - key: SEC_USER_AGENT
         sync: false
-      # Leave OPENAI_API_KEY unset to disable Retriever/Citations gracefully
-      - key: BASE_CURRENCY
-        value: USD
+      # If you later point to external Qdrant/Redis, add:
+      # - key: QDRANT_URL
+      #   sync: false
+      # - key: REDIS_URL
+      #   sync: false
       - key: EMBED_MODEL
         value: text-embedding-3-large
       - key: EMBED_DIM
         value: "3072"
+      - key: BASE_CURRENCY
+        value: USD
