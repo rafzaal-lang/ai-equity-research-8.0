@@ -476,6 +476,35 @@ def debug_fmp(ticker: str = "AAPL"):
     url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={key}"
     r = requests.get(url, timeout=30)
     return PlainTextResponse(f"status={r.status_code}\nurl={url}\nbody={r.text[:500]}")
+    from fastapi.responses import PlainTextResponse
+
+@app.get("/debug/fmp2", response_class=PlainTextResponse)
+def debug_fmp2(ticker: str = "AAPL"):
+    import os, requests, socket, json
+    key = os.getenv("FMP_API_KEY")
+    lines = []
+    if not key:
+        return PlainTextResponse("FMP_API_KEY missing", status_code=500)
+
+    # Quick DNS/egress checks
+    try:
+        ip = socket.gethostbyname("financialmodelingprep.com")
+        lines.append(f"DNS OK -> financialmodelingprep.com -> {ip}")
+    except Exception as e:
+        return PlainTextResponse(f"DNS ERROR: {repr(e)}", status_code=500)
+
+    url = f"https://financialmodelingprep.com/api/v3/quote-short/{ticker}?apikey={key}"
+    try:
+        with requests.Session() as s:
+            s.headers.update({"User-Agent": "equity-ui/1.0"})
+            r = s.get(url, timeout=30)
+            lines.append(f"HTTP status={r.status_code}")
+            # show 1st 500 chars to avoid log spam
+            lines.append(f"body={r.text[:500]}")
+            return PlainTextResponse("\n".join(lines), status_code=(200 if r.ok else 502))
+    except Exception as e:
+        return PlainTextResponse(f"REQUEST ERROR: {repr(e)}", status_code=500)
+
 
 
 
