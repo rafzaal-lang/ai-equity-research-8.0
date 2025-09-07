@@ -42,7 +42,7 @@ def _html_error(note: str, status: int = 502) -> HTMLResponse:
     block = f'<pre class="muted" style="white-space:pre-wrap">{escape(note)}</pre>'
     return HTMLResponse(render(REPORT_FORM + block, active="report"), status_code=status)
 
-# ---------- Fundamentals normalizer + FMP fallback ----------
+# ---------- Fundamentals normalizer + FMP fallbacks ----------
 def _pick(d, *names):
     for n in names:
         if isinstance(d, dict) and (n in d) and (d[n] is not None):
@@ -50,10 +50,7 @@ def _pick(d, *names):
     return None
 
 def _normalize_fundamentals_from_model(model):
-    """
-    Map whatever the model returns to the names the composer expects.
-    Looks inside model.core_financials or model.fundamentals.
-    """
+    """Map whatever the model returns to the names the composer expects."""
     src = model if isinstance(model, dict) else getattr(model, "__dict__", {})
     cf = (src.get("core_financials") or src.get("fundamentals") or {}) if isinstance(src, dict) else {}
     out = {
@@ -122,6 +119,27 @@ def fundamentals_fallback_fmp(ticker: str):
         "op_margin": om,
         "fcf_margin": fm,
     }
+
+# ---- Recompute market cap in USD (price * shares) to avoid non-USD caps ----
+def _market_cap_usd_fmp(ticker: str):
+    import requests
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return None
+    base = "https://financialmodelingprep.com/api/v3"
+    s = requests.Session()
+    s.headers.update({"User-Agent": "equity-ui/1.0"})
+
+    try:
+        q = s.get(f"{base}/quote/{ticker}", params={"apikey": key}, timeout=20).json() or []
+        p = (q[0] or {}).get("price") if q else None
+        prof = s.get(f"{base}/profile/{ticker}", params={"apikey": key}, timeout=20).json() or []
+        sh = (prof[0] or {}).get("sharesOutstanding") if prof else None
+        if p is None or sh is None:
+            return None
+        return float(p) * float(sh)
+    except Exception:
+        return None
 
 # ---------- inline templates ----------
 BASE_HTML = """
@@ -332,6 +350,20 @@ def post_report(
     except Exception as e:
         return _html_error(f"Comps/WACC/metrics error: {type(e).__name__}: {e}")
 
+    # --- normalize obviously non-USD market caps (e.g., JPY/KRW shown as $) ---
+    try:
+        rows = (comps or {}).get("peers", [])
+        for r in rows:
+            mc = r.get("market_cap")
+            # Heuristic: caps over ~$3T are likely non-USD for many foreign listings
+            if mc and mc > 3_000_000_000_000:
+                usd = _market_cap_usd_fmp(r.get("ticker"))
+                if usd:
+                    r["market_cap"] = usd
+        comps["peers"] = rows
+    except Exception:
+        pass  # never block the page
+
     # Optional citations
     citations: List[dict] = []
     if include_citations and OPENAI_API_KEY:
@@ -437,6 +469,20 @@ def download_report_md(
         return PlainTextResponse(f"Error: {model['error']}", status_code=400)
 
     comps = _compat_call(comps_table, ticker, as_of=as_of, max_peers=25)
+
+    # Apply same market cap USD normalization
+    try:
+        rows = (comps or {}).get("peers", [])
+        for r in rows:
+            mc = r.get("market_cap")
+            if mc and mc > 3_000_000_000_000:
+                usd = _market_cap_usd_fmp(r.get("ticker"))
+                if usd:
+                    r["market_cap"] = usd
+        comps["peers"] = rows
+    except Exception:
+        pass
+
     peers = [r["ticker"] for r in (comps or {}).get("peers", [])[1:]]
     w = _compat_call(peer_beta_wacc, ticker, peers, rf=rf, mrp=mrp, kd=kd, target_d_e=None, as_of=as_of)
 
