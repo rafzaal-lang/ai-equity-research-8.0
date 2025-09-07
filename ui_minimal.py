@@ -430,4 +430,31 @@ def retriever_post(query: str = Form(...), tickers: Optional[str] = Form(None)):
     except Exception as e:
         note = f'<p class="muted" style="margin-top:10px;">Error: {str(e)}</p>'
         return HTMLResponse(render(RETRIEVER_PAGE + note, active="retriever", hits=[], has_openai=True), status_code=500)
+        # --- quick diagnostics ---
+from fastapi.responses import PlainTextResponse
+
+@app.get("/debug/env", response_class=PlainTextResponse)
+def debug_env():
+    import os
+    keys = [
+        ("FMP_API_KEY", bool(os.getenv("FMP_API_KEY"))),
+        ("OPENAI_API_KEY", bool(os.getenv("OPENAI_API_KEY"))),
+        ("BASE_CURRENCY", os.getenv("BASE_CURRENCY", "")),
+    ]
+    lines = [f"{k}={'SET' if v else 'MISSING'}" if isinstance(v, bool) else f"{k}={v}" for k, v in keys]
+    return PlainTextResponse("\n".join(lines))
+
+@app.get("/debug/fmp", response_class=PlainTextResponse)
+def debug_fmp(ticker: str = "AAPL"):
+    import os, requests
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return PlainTextResponse("FMP_API_KEY missing", status_code=500)
+    url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={key}"
+    try:
+        r = requests.get(url, timeout=30)
+        return PlainTextResponse(f"status={r.status_code}\nurl={url}\nbody={r.text[:500]}")
+    except Exception as e:
+        return PlainTextResponse(f"request failed: {repr(e)}", status_code=500)
+
 
