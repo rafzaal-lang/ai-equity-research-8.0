@@ -51,7 +51,7 @@ def compose(payload: Dict[str, Any]) -> str:
     out.append(f"*As of:* `{as_of}`  ·  *Base currency:* *{base_ccy.lower()}*")
     out.append("")
 
-    # Summary (keep minimal; WACC & DCF range placeholders)
+    # Summary
     val = payload.get("valuation") or {}
     wacc = _get(val, "wacc")
     dcf = payload.get("dcf") or {}
@@ -86,7 +86,7 @@ def compose(payload: Dict[str, Any]) -> str:
         out.append(f"| {k} | {v} |")
     out.append("")
 
-    # Valuation (can stay concise; WACC already shown)
+    # Valuation
     out.append("## Valuation")
     out.append(f"- **WACC:** {_pct(wacc, 2)}")
     out.append(f"- **DCF Value (Low / Base / High):** {_money(low)} / {_money(base)} / {_money(high)}")
@@ -144,4 +144,3 @@ def compose(payload: Dict[str, Any]) -> str:
         out.append("")
 
     return "\n".join(out)
-
