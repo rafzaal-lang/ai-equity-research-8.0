@@ -1,7 +1,6 @@
 # ui_minimal.py
 # Minimal, production-friendly FastAPI UI.
-# - Keeps imports light at module load (heavy deps are lazy-imported inside routes)
-# - Works on Render or Docker: start with `uvicorn ui_minimal:app --host 0.0.0.0 --port $PORT`
+# Start (Render): uvicorn ui_minimal:app --host 0.0.0.0 --port $PORT
 
 from __future__ import annotations
 import os
@@ -21,6 +20,20 @@ def health():
 BASE_CURRENCY = os.getenv("BASE_CURRENCY", "USD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
+
+# ---- Compatibility helper (drop unknown kwargs to older backends) ----
+def _compat_call(func, *args, **kwargs):
+    import inspect
+    sig = inspect.signature(func)
+    allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return func(*args, **allowed)
+
+# Optional tenacity type (if installed)
+try:
+    from tenacity import RetryError as _TenacityRetryError
+except Exception:  # pragma: no cover
+    class _TenacityRetryError(Exception): ...
+# ------------------------------------------------------
 
 BASE_HTML = """
 <!doctype html>
@@ -244,15 +257,26 @@ def post_report(
     from src.services.wacc.peer_beta import peer_beta_wacc
     from src.services.report.composer import compose as compose_report
 
-    # Build core model
-    model = build_model(ticker, force_refresh=False)
-    if "error" in model:
-        msg = f'<p class="muted" style="margin-top:10px;">Error: {model["error"]}</p>'
-        return HTMLResponse(render(REPORT_FORM + msg, active="report"), status_code=400)
+    # Build core model, show root cause if retries explode
+    try:
+        model = build_model(ticker, force_refresh=False)
+    except Exception as e:
+        if isinstance(e, _TenacityRetryError) and hasattr(e, "last_attempt"):
+            root = e.last_attempt.exception()
+            msg = f"RetryError -> {type(root).__name__}: {root}"
+        else:
+            msg = f"{type(e).__name__}: {e}"
+        note = f'<pre class="muted" style="white-space:pre-wrap">Error while fetching data: {msg}</pre>'
+        return HTMLResponse(render(REPORT_FORM + note, active="report"), status_code=502)
 
-    comps = comps_table(ticker, as_of=as_of, max_peers=25)
-    peers = [r["ticker"] for r in comps["peers"][1:]]
-    w = peer_beta_wacc(ticker, peers, rf=rf, mrp=mrp, kd=kd, target_d_e=None, as_of=as_of)
+    if isinstance(model, dict) and "error" in model:
+        note = f'<pre class="muted" style="white-space:pre-wrap">Model error: {model["error"]}</pre>'
+        return HTMLResponse(render(REPORT_FORM + note, active="report"), status_code=400)
+
+    # comps / wacc with compat shim (handles older service signatures)
+    comps = _compat_call(comps_table, ticker, as_of=as_of, max_peers=25)
+    peers = [r["ticker"] for r in comps["peers"][1:]] if comps and "peers" in comps else []
+    w = _compat_call(peer_beta_wacc, ticker, peers, rf=rf, mrp=mrp, kd=kd, target_d_e=None, as_of=as_of)
 
     # Optional citations via embeddings + qdrant
     citations: List[dict] = []
@@ -265,9 +289,9 @@ def post_report(
             emb = client.embeddings.create(model=EMBED_MODEL, input=f"{ticker} latest 10-K 10-Q risk factors management discussion").data[0].embedding
             raw_hits = vec_search(emb, k=8, tickers=[ticker.upper()])
             rescored = []
-            for h in raw_hits:
+            for h in raw_hits or []:
                 p = h.get("payload", {}) or {}
-                s = final_score(h["score"], p.get("filing_date"), p.get("source_type"),
+                s = final_score(h.get("score", 0.0), p.get("filing_date"), p.get("source_type"),
                                 [p.get("ticker")] if p.get("ticker") else None, [ticker.upper()])
                 rescored.append((s, p))
             rescored.sort(key=lambda x: x[0], reverse=True)
@@ -290,23 +314,23 @@ def post_report(
         "target_low": "—",
         "target_high": "—",
         "base_currency": BASE_CURRENCY,
-        "fundamentals": model["core_financials"],
-        "dcf": model.get("dcf_valuation"),
-        "valuation": {"wacc": w.get("wacc")},
-        "comps": {"peers": comps["peers"]},
+        "fundamentals": model["core_financials"] if isinstance(model, dict) else getattr(model, "core_financials", {}),
+        "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
+        "valuation": {"wacc": w.get("wacc") if isinstance(w, dict) else None},
+        "comps": {"peers": comps.get("peers", []) if isinstance(comps, dict) else []},
         "citations": citations,
         "artifact_id": "ui-session",
     })
     report_html = md.markdown(md_text, extensions=["tables"])
 
-    lm = latest_metrics(ticker, as_of=as_of)
+    lm = _compat_call(latest_metrics, ticker, as_of=as_of)
     def fmt_money(x): return f"${x:,.0f}" if isinstance(x, (int, float)) and x is not None else "—"
     def fmt_pct(x): return f"{x*100:.2f}%" if isinstance(x, (int, float)) and x is not None else "—"
     kpis = {
-        "market_cap": fmt_money(lm.get("market_cap")),
-        "ev": fmt_money(lm.get("enterprise_value")),
-        "pe": f"{lm.get('pe'):.2f}" if lm.get("pe") is not None else "—",
-        "fcf_yield": fmt_pct(lm.get("fcf_yield")),
+        "market_cap": fmt_money((lm or {}).get("market_cap")),
+        "ev": fmt_money((lm or {}).get("enterprise_value")),
+        "pe": f"{(lm or {}).get('pe'):.2f}" if (lm or {}).get("pe") is not None else "—",
+        "fcf_yield": fmt_pct((lm or {}).get("fcf_yield")),
     }
 
     return HTMLResponse(render(REPORT_RESULT, active="report",
@@ -327,13 +351,20 @@ def download_report_md(
     from src.services.wacc.peer_beta import peer_beta_wacc
     from src.services.report.composer import compose as compose_report
 
-    model = build_model(ticker, force_refresh=False)
-    if "error" in model:
+    try:
+        model = build_model(ticker, force_refresh=False)
+    except Exception as e:
+        if isinstance(e, _TenacityRetryError) and hasattr(e, "last_attempt"):
+            root = e.last_attempt.exception()
+            return PlainTextResponse(f"Error: RetryError -> {type(root).__name__}: {root}", status_code=502)
+        return PlainTextResponse(f"Error: {type(e).__name__}: {e}", status_code=502)
+
+    if isinstance(model, dict) and "error" in model:
         return PlainTextResponse(f"Error: {model['error']}", status_code=400)
 
-    comps = comps_table(ticker, as_of=as_of, max_peers=25)
-    peers = [r["ticker"] for r in comps["peers"][1:]]
-    w = peer_beta_wacc(ticker, peers, rf=rf, mrp=mrp, kd=kd, target_d_e=None, as_of=as_of)
+    comps = _compat_call(comps_table, ticker, as_of=as_of, max_peers=25)
+    peers = [r["ticker"] for r in comps.get("peers", [])[1:]] if isinstance(comps, dict) else []
+    w = _compat_call(peer_beta_wacc, ticker, peers, rf=rf, mrp=mrp, kd=kd, target_d_e=None, as_of=as_of)
 
     citations: List[dict] = []
     if cit == "1" and OPENAI_API_KEY:
@@ -345,9 +376,9 @@ def download_report_md(
             emb = client.embeddings.create(model=EMBED_MODEL, input=f"{ticker} latest 10-K 10-Q risk factors management discussion").data[0].embedding
             raw_hits = vec_search(emb, k=8, tickers=[ticker.upper()])
             rescored = []
-            for h in raw_hits:
+            for h in raw_hits or []:
                 p = h.get("payload", {}) or {}
-                s = final_score(h["score"], p.get("filing_date"), p.get("source_type"),
+                s = final_score(h.get("score", 0.0), p.get("filing_date"), p.get("source_type"),
                                 [p.get("ticker")] if p.get("ticker") else None, [ticker.upper()])
                 rescored.append((s, p))
             rescored.sort(key=lambda x: x[0], reverse=True)
@@ -369,10 +400,10 @@ def download_report_md(
         "target_low": "—",
         "target_high": "—",
         "base_currency": BASE_CURRENCY,
-        "fundamentals": model["core_financials"],
-        "dcf": model.get("dcf_valuation"),
-        "valuation": {"wacc": w.get("wacc")},
-        "comps": {"peers": comps["peers"]},
+        "fundamentals": model["core_financials"] if isinstance(model, dict) else getattr(model, "core_financials", {}),
+        "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
+        "valuation": {"wacc": w.get("wacc") if isinstance(w, dict) else None},
+        "comps": {"peers": comps.get("peers", []) if isinstance(comps, dict) else []},
         "citations": citations,
         "artifact_id": "ui-session",
     })
@@ -389,8 +420,8 @@ def screens_post(
     as_of: Optional[str] = Form(None),
 ):
     from src.services.comps.engine import comps_table
-    data = comps_table(base_ticker, as_of=as_of, max_peers=50)
-    rows = data["peers"]
+    data = _compat_call(comps_table, base_ticker, as_of=as_of, max_peers=50)
+    rows = (data or {}).get("peers", [])
     if size_min is not None:
         rows = [r for r in rows if (r.get("market_cap") or 0) >= size_min]
     return HTMLResponse(render(SCREENS_PAGE, active="screens", rows=rows))
@@ -413,12 +444,12 @@ def retriever_post(query: str = Form(...), tickers: Optional[str] = Form(None)):
         client = OpenAI(api_key=OPENAI_API_KEY)
         emb = client.embeddings.create(model=EMBED_MODEL, input=query).data[0].embedding
         tickers_list = [t.strip().upper() for t in tickers.split(",")] if tickers else None
-        raw_hits = vec_search(emb, k=12, tickers=tickers_list)
+        raw_hits = vec_search(emb, k=12, tickers=tickers_list) or []
         rescored = []
         for h in raw_hits:
             p = h.get("payload", {}) or {}
             s = final_score(
-                h["score"],
+                h.get("score", 0.0),
                 p.get("filing_date"),
                 p.get("source_type"),
                 [p.get("ticker")] if p.get("ticker") else None,
@@ -430,81 +461,34 @@ def retriever_post(query: str = Form(...), tickers: Optional[str] = Form(None)):
     except Exception as e:
         note = f'<p class="muted" style="margin-top:10px;">Error: {str(e)}</p>'
         return HTMLResponse(render(RETRIEVER_PAGE + note, active="retriever", hits=[], has_openai=True), status_code=500)
-        # --- quick diagnostics ---
-from fastapi.responses import PlainTextResponse
 
-@app.get("/debug/env", response_class=PlainTextResponse)
-def debug_env():
-    import os
-    keys = [
-        ("FMP_API_KEY", bool(os.getenv("FMP_API_KEY"))),
-        ("OPENAI_API_KEY", bool(os.getenv("OPENAI_API_KEY"))),
-        ("BASE_CURRENCY", os.getenv("BASE_CURRENCY", "")),
-    ]
-    lines = [f"{k}={'SET' if v else 'MISSING'}" if isinstance(v, bool) else f"{k}={v}" for k, v in keys]
-    return PlainTextResponse("\n".join(lines))
-
-@app.get("/debug/fmp", response_class=PlainTextResponse)
-def debug_fmp(ticker: str = "AAPL"):
-    import os, requests
-    key = os.getenv("FMP_API_KEY")
-    if not key:
-        return PlainTextResponse("FMP_API_KEY missing", status_code=500)
-    url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={key}"
-    try:
-        r = requests.get(url, timeout=30)
-        return PlainTextResponse(f"status={r.status_code}\nurl={url}\nbody={r.text[:500]}")
-    except Exception as e:
-        return PlainTextResponse(f"request failed: {repr(e)}", status_code=500)
-        from fastapi.responses import PlainTextResponse
-import os, requests
-
+# --- debug endpoints (single, clean set) ---
 @app.get("/debug/env", response_class=PlainTextResponse)
 def debug_env():
     keys = [
         ("FMP_API_KEY", bool(os.getenv("FMP_API_KEY"))),
         ("OPENAI_API_KEY", bool(os.getenv("OPENAI_API_KEY"))),
         ("REDIS_URL", bool(os.getenv("REDIS_URL"))),
+        ("BASE_CURRENCY", os.getenv("BASE_CURRENCY", "")),
     ]
-    return PlainTextResponse("\n".join(f"{k}={'SET' if v else 'MISSING'}" for k, v in keys))
-
-@app.get("/debug/fmp", response_class=PlainTextResponse)
-def debug_fmp(ticker: str = "AAPL"):
-    key = os.getenv("FMP_API_KEY")
-    if not key:
-        return PlainTextResponse("FMP_API_KEY missing", status_code=500)
-    url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={key}"
-    r = requests.get(url, timeout=30)
-    return PlainTextResponse(f"status={r.status_code}\nurl={url}\nbody={r.text[:500]}")
-    from fastapi.responses import PlainTextResponse
+    lines = [f"{k}={'SET' if v else 'MISSING'}" if isinstance(v, bool) else f"{k}={v}" for k, v in keys]
+    return PlainTextResponse("\n".join(lines))
 
 @app.get("/debug/fmp2", response_class=PlainTextResponse)
 def debug_fmp2(ticker: str = "AAPL"):
-    import os, requests, socket, json
+    import socket, requests
     key = os.getenv("FMP_API_KEY")
-    lines = []
     if not key:
         return PlainTextResponse("FMP_API_KEY missing", status_code=500)
-
-    # Quick DNS/egress checks
     try:
         ip = socket.gethostbyname("financialmodelingprep.com")
-        lines.append(f"DNS OK -> financialmodelingprep.com -> {ip}")
+        dns_line = f"DNS OK -> financialmodelingprep.com -> {ip}"
     except Exception as e:
         return PlainTextResponse(f"DNS ERROR: {repr(e)}", status_code=500)
 
-    url = f"https://financialmodelingprep.com/api/v3/quote-short/{ticker}?apikey={key}"
+    url = f"https://financialmodelingprep.com/api/v3/quote-short/{ticker}"
     try:
-        with requests.Session() as s:
-            s.headers.update({"User-Agent": "equity-ui/1.0"})
-            r = s.get(url, timeout=30)
-            lines.append(f"HTTP status={r.status_code}")
-            # show 1st 500 chars to avoid log spam
-            lines.append(f"body={r.text[:500]}")
-            return PlainTextResponse("\n".join(lines), status_code=(200 if r.ok else 502))
+        r = requests.get(url, params={"apikey": key}, timeout=30, headers={"User-Agent":"equity-ui/1.0"})
+        return PlainTextResponse(f"{dns_line}\nHTTP status={r.status_code}\nbody={r.text[:500]}", status_code=(200 if r.ok else 502))
     except Exception as e:
-        return PlainTextResponse(f"REQUEST ERROR: {repr(e)}", status_code=500)
-
-
-
-
+        return PlainTextResponse(f"{dns_line}\nREQUEST ERROR: {repr(e)}", status_code=500)
