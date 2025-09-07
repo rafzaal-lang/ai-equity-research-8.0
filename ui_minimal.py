@@ -120,8 +120,41 @@ def fundamentals_fallback_fmp(ticker: str):
         "fcf_margin": fm,
     }
 
-# ---- Recompute market cap in USD (price * shares) to avoid non-USD caps ----
+# ---------- FX + USD market cap normalization ----------
+def _fx_rate_fmp(frm: str, to: str, session=None):
+    """Return frm->to rate using FMP; tries /convert then /fx/{pair}."""
+    import requests
+    key = os.getenv("FMP_API_KEY")
+    base = "https://financialmodelingprep.com/api/v3"
+    s = session or requests.Session()
+
+    # 1) /convert
+    try:
+        r = s.get(f"{base}/convert", params={"from": frm, "to": to, "amount": 1, "apikey": key}, timeout=20)
+        j = r.json()
+        if isinstance(j, dict):
+            for k in ("result", "price", "conversion_result"):
+                v = j.get(k)
+                if v is not None:
+                    return float(v)
+    except Exception:
+        pass
+
+    # 2) /fx/{pair}
+    for pair, inv in ((f"{frm}{to}", 1.0), (f"{to}{frm}", -1.0)):
+        try:
+            j = s.get(f"{base}/fx/{pair}", params={"apikey": key}, timeout=20).json()
+            if isinstance(j, list) and j:
+                v = j[0].get("price") or j[0].get("bid") or j[0].get("ask")
+                if v is not None:
+                    rate = float(v)
+                    return rate if inv > 0 else (1.0 / rate)
+        except Exception:
+            pass
+    return None
+
 def _market_cap_usd_fmp(ticker: str):
+    """Compute MC in USD = price * sharesOutstanding * FX(cur->USD)."""
     import requests
     key = os.getenv("FMP_API_KEY")
     if not key:
@@ -131,15 +164,99 @@ def _market_cap_usd_fmp(ticker: str):
     s.headers.update({"User-Agent": "equity-ui/1.0"})
 
     try:
-        q = s.get(f"{base}/quote/{ticker}", params={"apikey": key}, timeout=20).json() or []
-        p = (q[0] or {}).get("price") if q else None
         prof = s.get(f"{base}/profile/{ticker}", params={"apikey": key}, timeout=20).json() or []
-        sh = (prof[0] or {}).get("sharesOutstanding") if prof else None
-        if p is None or sh is None:
+        q    = s.get(f"{base}/quote/{ticker}",   params={"apikey": key}, timeout=20).json() or []
+        p0, q0 = (prof[0] if prof else {}), (q[0] if q else {})
+        price  = q0.get("price")
+        shares = p0.get("sharesOutstanding")
+        native_mc = (float(price) * float(shares)) if (price is not None and shares is not None) else (q0.get("marketCap") or p0.get("mktCap"))
+        if native_mc is None:
             return None
-        return float(p) * float(sh)
+        cur = (p0.get("currency") or "USD").upper()
+        if cur == "USD":
+            return float(native_mc)
+        rate = _fx_rate_fmp(cur, "USD", session=s)
+        return float(native_mc) * float(rate) if rate else float(native_mc)
     except Exception:
         return None
+
+# ---------- FMP filings fallback (citations if vector DB empty) ----------
+def _fmp_recent_filings(ticker: str, limit: int = 5, forms=None):
+    """Return recent filings (form, date, link) using FMP; forms=['10-K','10-Q'] to filter."""
+    import requests
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return []
+    base = "https://financialmodelingprep.com/api/v3"
+    s = requests.Session()
+    s.headers.update({"User-Agent": "equity-ui/1.0"})
+    try:
+        j = s.get(f"{base}/sec_filings/{ticker}", params={"apikey": key, "limit": limit}, timeout=25).json() or []
+        rows = []
+        for r in j:
+            form = (r.get("type") or r.get("form") or "").upper()
+            if forms and form not in forms:
+                continue
+            rows.append({
+                "form": form,
+                "date": r.get("acceptedDate") or r.get("fillingDate") or r.get("date"),
+                "title": r.get("title") or r.get("finalLink") or r.get("link"),
+                "url": r.get("finalLink") or r.get("link")
+            })
+        return rows
+    except Exception:
+        return []
+
+# ---------- Optional: latest quarter snapshot (YoY deltas + short AI blurb) ----------
+def latest_quarter_snapshot(ticker: str):
+    """Return period + simple YoY deltas; optionally add 2-sentence narrative."""
+    import requests
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return {}
+    base = "https://financialmodelingprep.com/api/v3"
+    s = requests.Session(); s.headers.update({"User-Agent": "equity-ui/1.0"})
+
+    inc = s.get(f"{base}/income-statement/{ticker}", params={"period":"quarter","limit":6,"apikey":key}, timeout=30).json() or []
+    if len(inc) < 5:
+        return {}
+
+    cur = inc[0]; yr_ago = inc[4]  # same quarter prior year
+    def pct(a,b):
+        try:
+            if b in (0, None) or a is None: return None
+            return (float(a)-float(b))/float(b)
+        except Exception: return None
+
+    snap = {
+        "period": cur.get("date") or cur.get("calendarYear"),
+        "revenue_yoy": pct(cur.get("revenue"), yr_ago.get("revenue")),
+        "eps_yoy":     pct(cur.get("eps"), yr_ago.get("eps")),
+        "op_income_yoy": pct(cur.get("operatingIncome"), yr_ago.get("operatingIncome")),
+        "notes": None,
+    }
+
+    # Optional short blurb if OpenAI key present
+    try:
+        if OPENAI_API_KEY:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            prompt = (
+                f"Write 2 concise sentences on {ticker}'s latest quarter "
+                f"using YoY deltas (Revenue {snap['revenue_yoy']}, EPS {snap['eps_yoy']}, "
+                f"Operating income {snap['op_income_yoy']}). No hype, just facts."
+            )
+            blurb = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content":prompt}],
+                max_tokens=80,
+                temperature=0.2,
+            ).choices[0].message.content.strip()
+            snap["notes"] = blurb
+    except Exception:
+        pass
+
+    return snap
 
 # ---------- inline templates ----------
 BASE_HTML = """
@@ -162,7 +279,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 .input,.number{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#fff}
 .row{display:grid;gap:10px;grid-template-columns:repeat(3,1fr)}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--ink);color:#fff;background:var(--ink);cursor:pointer}
-.btn.secondary{background:#fff;color:var(--ink);border-color:var(--line)}
+.btn.secondary{background:#fff;color:#0a0a0a;border-color:var(--line)}
 .muted{color:var(--muted)}
 .cards{display:grid;gap:10px;grid-template-columns:repeat(2,1fr)} @media (min-width:960px){.cards{grid-template-columns:repeat(4,1fr)}}
 .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:12px}
@@ -350,21 +467,21 @@ def post_report(
     except Exception as e:
         return _html_error(f"Comps/WACC/metrics error: {type(e).__name__}: {e}")
 
-    # --- normalize obviously non-USD market caps (e.g., JPY/KRW shown as $) ---
+    # --- normalize peer market caps to USD for all rows ---
     try:
         rows = (comps or {}).get("peers", [])
         for r in rows:
-            mc = r.get("market_cap")
-            # Heuristic: caps over ~$3T are likely non-USD for many foreign listings
-            if mc and mc > 3_000_000_000_000:
-                usd = _market_cap_usd_fmp(r.get("ticker"))
-                if usd:
+            usd = _market_cap_usd_fmp(r.get("ticker"))
+            if usd:
+                cur_mc = r.get("market_cap")
+                # update if missing or differs materially (>25%)
+                if (cur_mc is None) or (abs(usd - cur_mc) / max(usd, cur_mc) > 0.25):
                     r["market_cap"] = usd
         comps["peers"] = rows
     except Exception:
-        pass  # never block the page
+        pass
 
-    # Optional citations
+    # Optional citations via vector DB; fallback to FMP filings if empty
     citations: List[dict] = []
     if include_citations and OPENAI_API_KEY:
         try:
@@ -389,12 +506,23 @@ def post_report(
                     "url": p.get("source_url"),
                 })
         except Exception:
-            pass  # show the report even if citations fail
+            pass
 
-    # --------- Fundamentals (normalize or fallback to FMP) ----------
-    fundamentals = _normalize_fundamentals_from_model(model)
-    if not fundamentals:
-        fundamentals = fundamentals_fallback_fmp(ticker)
+    # Fallback to FMP filing links if no embedding hits
+    if include_citations and not citations:
+        for f in _fmp_recent_filings(ticker, limit=5, forms=["10-K", "10-Q"]):
+            citations.append({
+                "title": f"{f['form']} {f['date']}",
+                "source_type": "SEC via FMP",
+                "date": f["date"],
+                "url": f["url"],
+            })
+
+    # Fundamentals (normalize or fallback to FMP)
+    fundamentals = _normalize_fundamentals_from_model(model) or fundamentals_fallback_fmp(ticker)
+
+    # Optional latest quarter snapshot
+    quarter = latest_quarter_snapshot(ticker)
 
     # Compose + KPIs
     try:
@@ -411,6 +539,7 @@ def post_report(
             "valuation": {"wacc": (w or {}).get("wacc")},
             "comps": {"peers": (comps or {}).get("peers", [])},
             "citations": citations,
+            "quarter": quarter or {},
             "artifact_id": "ui-session",
         })
         report_html = md.markdown(md_text, extensions=["tables"])
@@ -474,10 +603,10 @@ def download_report_md(
     try:
         rows = (comps or {}).get("peers", [])
         for r in rows:
-            mc = r.get("market_cap")
-            if mc and mc > 3_000_000_000_000:
-                usd = _market_cap_usd_fmp(r.get("ticker"))
-                if usd:
+            usd = _market_cap_usd_fmp(r.get("ticker"))
+            if usd:
+                cur_mc = r.get("market_cap")
+                if (cur_mc is None) or (abs(usd - cur_mc) / max(usd, cur_mc) > 0.25):
                     r["market_cap"] = usd
         comps["peers"] = rows
     except Exception:
@@ -486,6 +615,7 @@ def download_report_md(
     peers = [r["ticker"] for r in (comps or {}).get("peers", [])[1:]]
     w = _compat_call(peer_beta_wacc, ticker, peers, rf=rf, mrp=mrp, kd=kd, target_d_e=None, as_of=as_of)
 
+    # Citations
     citations: List[dict] = []
     if cit == "1" and OPENAI_API_KEY:
         try:
@@ -512,7 +642,17 @@ def download_report_md(
         except Exception:
             pass
 
+    if (cit == "1") and not citations:
+        for f in _fmp_recent_filings(ticker, limit=5, forms=["10-K", "10-Q"]):
+            citations.append({
+                "title": f"{f['form']} {f['date']}",
+                "source_type": "SEC via FMP",
+                "date": f["date"],
+                "url": f["url"],
+            })
+
     fundamentals = _normalize_fundamentals_from_model(model) or fundamentals_fallback_fmp(ticker)
+    quarter = latest_quarter_snapshot(ticker)
 
     md_text = compose_report({
         "symbol": ticker.upper(),
@@ -527,6 +667,7 @@ def download_report_md(
         "valuation": {"wacc": (w or {}).get("wacc")},
         "comps": {"peers": (comps or {}).get("peers", [])},
         "citations": citations,
+        "quarter": quarter or {},
         "artifact_id": "ui-session",
     })
     return PlainTextResponse(md_text)
@@ -614,3 +755,8 @@ def debug_fmp2(ticker: str = "AAPL"):
         return PlainTextResponse(f"{dns_line}\nHTTP status={r.status_code}\nbody={r.text[:500]}", status_code=(200 if r.ok else 502))
     except Exception as e:
         return PlainTextResponse(f"{dns_line}\nREQUEST ERROR: {repr(e)}", status_code=500)
+
+@app.get("/debug/mc", response_class=PlainTextResponse)
+def debug_mc(ticker: str):
+    usd = _market_cap_usd_fmp(ticker)
+    return PlainTextResponse(f"{ticker} market_cap_usd={usd:,.0f}" if usd else f"{ticker} failed")
