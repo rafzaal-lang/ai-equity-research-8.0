@@ -305,7 +305,7 @@ def post_report(
 
     return HTMLResponse(render(REPORT_RESULT, active="report",
                                report_html=report_html, ticker=ticker.upper(), as_of=as_of,
-                               rf=rf, mrp=mrp, kd=kd, include_citations=bool(include_citations), kpis=kpis)))
+                               rf=rf, mrp=mrp, kd=kd, include_citations=bool(include_citations), kpis=kpis))
 
 # Plain-text and md aliases (useful for debugging)
 @app.get("/report_plain", response_class=PlainTextResponse)
