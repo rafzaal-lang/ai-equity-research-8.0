@@ -32,6 +32,31 @@ def root():
         }
     }
 
+# --- Mount feature routers ---
+try:
+    from apis.sectors.service import router as sectors_router
+    app.include_router(sectors_router, prefix="/v1")
+except Exception:
+    pass
+
+try:
+    from apis.earnings.service import router as earnings_router
+    app.include_router(earnings_router, prefix="/v1")
+except Exception:
+    pass
+
+try:
+    from apis.transcripts.service import router as transcripts_router
+    app.include_router(transcripts_router, prefix="/v1")
+except Exception:
+    pass
+
+try:
+    from apis.comps.service import router as comps_router
+    app.include_router(comps_router, prefix="/v1")
+except Exception:
+    pass
+
 # HEALTH CHECK ENDPOINTS - Fix for health check 404s
 @app.get("/health")
 def health_simple():
