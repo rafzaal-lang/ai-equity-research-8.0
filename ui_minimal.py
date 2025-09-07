@@ -456,5 +456,26 @@ def debug_fmp(ticker: str = "AAPL"):
         return PlainTextResponse(f"status={r.status_code}\nurl={url}\nbody={r.text[:500]}")
     except Exception as e:
         return PlainTextResponse(f"request failed: {repr(e)}", status_code=500)
+        from fastapi.responses import PlainTextResponse
+import os, requests
+
+@app.get("/debug/env", response_class=PlainTextResponse)
+def debug_env():
+    keys = [
+        ("FMP_API_KEY", bool(os.getenv("FMP_API_KEY"))),
+        ("OPENAI_API_KEY", bool(os.getenv("OPENAI_API_KEY"))),
+        ("REDIS_URL", bool(os.getenv("REDIS_URL"))),
+    ]
+    return PlainTextResponse("\n".join(f"{k}={'SET' if v else 'MISSING'}" for k, v in keys))
+
+@app.get("/debug/fmp", response_class=PlainTextResponse)
+def debug_fmp(ticker: str = "AAPL"):
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return PlainTextResponse("FMP_API_KEY missing", status_code=500)
+    url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={key}"
+    r = requests.get(url, timeout=30)
+    return PlainTextResponse(f"status={r.status_code}\nurl={url}\nbody={r.text[:500]}")
+
 
 
