@@ -116,6 +116,19 @@ def compose(payload: Dict[str, Any]) -> str:
         out.append("_No comps available._")
     out.append("")
 
+# Latest quarter (if provided)
+q = payload.get("quarter") or {}
+if q:
+    out.append("## Latest quarter")
+    period = q.get("period") or "—"
+    def _p(x): 
+        return ("—" if x is None else f"{float(x)*100:.1f}%")
+    out.append(f"*Period:* `{period}`  •  *Revenue YoY:* {_p(q.get('revenue_yoy'))}  •  *EPS YoY:* {_p(q.get('eps_yoy'))}  •  *OpInc YoY:* {_p(q.get('op_income_yoy'))}")
+    if q.get("notes"):
+        out.append("")
+        out.append(q["notes"])
+    out.append("")
+    
     # --- Citations ---
     if citations:
         out.append("## Citations")
