@@ -223,7 +223,7 @@ def post_report(
     from src.services.financial_modeler import build_model
     from src.services.comps.engine import comps_table, latest_metrics
     from src.services.wacc.peer_beta import peer_beta_wacc
-    from src.services.report.composer import compose as compose_report
+    from reports.composer import compose as compose_report
 
     # Build model with readable errors
     try:
