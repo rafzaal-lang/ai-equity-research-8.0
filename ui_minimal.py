@@ -15,6 +15,11 @@ app = FastAPI(title="Equity Research — Minimal UI")
 def health():
     return {"ok": True}
 
+# Quiet Render "HEAD / 405" health checks
+@app.head("/", response_class=PlainTextResponse)
+def _head_root():
+    return PlainTextResponse("", status_code=200)
+
 BASE_CURRENCY = os.getenv("BASE_CURRENCY", "USD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
@@ -36,6 +41,87 @@ def _html_error(note: str, status: int = 502) -> HTMLResponse:
     from html import escape
     block = f'<pre class="muted" style="white-space:pre-wrap">{escape(note)}</pre>'
     return HTMLResponse(render(REPORT_FORM + block, active="report"), status_code=status)
+
+# ---------- Fundamentals normalizer + FMP fallback ----------
+def _pick(d, *names):
+    for n in names:
+        if isinstance(d, dict) and (n in d) and (d[n] is not None):
+            return d[n]
+    return None
+
+def _normalize_fundamentals_from_model(model):
+    """
+    Map whatever the model returns to the names the composer expects.
+    Looks inside model.core_financials or model.fundamentals.
+    """
+    src = model if isinstance(model, dict) else getattr(model, "__dict__", {})
+    cf = (src.get("core_financials") or src.get("fundamentals") or {}) if isinstance(src, dict) else {}
+    out = {
+        "revenue":      _pick(cf, "revenue", "ttm_revenue", "revenue_ttm", "total_revenue"),
+        "ebit":         _pick(cf, "ebit", "operating_income", "operatingIncome"),
+        "net_income":   _pick(cf, "net_income", "netIncome", "netIncomeTTM"),
+        "fcf":          _pick(cf, "fcf", "free_cash_flow", "freeCashFlow", "freeCashFlowTTM"),
+        "gross_margin": _pick(cf, "gross_margin", "grossMarginTTM", "gross_margin_ttm"),
+        "op_margin":    _pick(cf, "op_margin", "operatingMarginTTM", "operating_margin_ttm"),
+        "fcf_margin":   _pick(cf, "fcf_margin"),
+        "roic":         _pick(cf, "roic", "roicTTM"),
+        "de_ratio":     _pick(cf, "de_ratio", "debtToEquityTTM", "debt_equity"),
+    }
+    return out if any(v is not None for v in out.values()) else None
+
+def _ttm_from_fmp_quarters(arr, key, n=4):
+    try:
+        s, seen = 0.0, 0
+        for row in (arr or [])[:n]:
+            v = row.get(key)
+            if v is None:
+                continue
+            s += float(v)
+            seen += 1
+        return s if seen else None
+    except Exception:
+        return None
+
+def fundamentals_fallback_fmp(ticker: str):
+    """Lightweight TTM fallback using FMP (sum of last 4 quarters)."""
+    import requests
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return {}
+
+    base = "https://financialmodelingprep.com/api/v3"
+    s = requests.Session()
+    s.headers.update({"User-Agent": "equity-ui/1.0"})
+
+    try:
+        inc = s.get(f"{base}/income-statement/{ticker}",
+                    params={"period": "quarter", "limit": 4, "apikey": key},
+                    timeout=30).json()
+        cfs = s.get(f"{base}/cash-flow-statement/{ticker}",
+                    params={"period": "quarter", "limit": 4, "apikey": key},
+                    timeout=30).json()
+    except Exception:
+        return {}
+
+    rev = _ttm_from_fmp_quarters(inc, "revenue")
+    opi = _ttm_from_fmp_quarters(inc, "operatingIncome")   # EBIT proxy
+    ni  = _ttm_from_fmp_quarters(inc, "netIncome")
+    gp  = _ttm_from_fmp_quarters(inc, "grossProfit")
+    fcf = _ttm_from_fmp_quarters(cfs, "freeCashFlow")
+
+    gm = (gp / rev) if (gp is not None and rev not in (None, 0)) else None
+    om = (opi / rev) if (opi is not None and rev not in (None, 0)) else None
+    fm = (fcf / rev) if (fcf is not None and rev not in (None, 0)) else None
+
+    return {
+        "revenue": rev,
+        "ebit": opi,
+        "net_income": ni,
+        "fcf": fcf,
+        "gross_margin": gm,
+        "op_margin": om,
+        "fcf_margin": fm,
+    }
 
 # ---------- inline templates ----------
 BASE_HTML = """
@@ -273,6 +359,11 @@ def post_report(
         except Exception:
             pass  # show the report even if citations fail
 
+    # --------- Fundamentals (normalize or fallback to FMP) ----------
+    fundamentals = _normalize_fundamentals_from_model(model)
+    if not fundamentals:
+        fundamentals = fundamentals_fallback_fmp(ticker)
+
     # Compose + KPIs
     try:
         md_text = compose_report({
@@ -283,7 +374,7 @@ def post_report(
             "target_low": "—",
             "target_high": "—",
             "base_currency": BASE_CURRENCY,
-            "fundamentals": model["core_financials"] if isinstance(model, dict) else getattr(model, "core_financials", {}),
+            "fundamentals": fundamentals or {},
             "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
             "valuation": {"wacc": (w or {}).get("wacc")},
             "comps": {"peers": (comps or {}).get("peers", [])},
@@ -303,21 +394,20 @@ def post_report(
         "fcf_yield": pct((lm or {}).get("fcf_yield")),
     }
 
-return HTMLResponse(
-    render(
-        REPORT_RESULT,
-        active="report",
-        report_html=report_html,
-        ticker=ticker.upper(),
-        as_of=as_of,
-        rf=rf,
-        mrp=mrp,
-        kd=kd,
-        include_citations=bool(include_citations),
-        kpis=kpis,
+    return HTMLResponse(
+        render(
+            REPORT_RESULT,
+            active="report",
+            report_html=report_html,
+            ticker=ticker.upper(),
+            as_of=as_of,
+            rf=rf,
+            mrp=mrp,
+            kd=kd,
+            include_citations=bool(include_citations),
+            kpis=kpis,
+        )
     )
-)
-
 
 # Plain-text and md aliases (useful for debugging)
 @app.get("/report_plain", response_class=PlainTextResponse)
@@ -333,7 +423,7 @@ def download_report_md(
     from src.services.financial_modeler import build_model
     from src.services.comps.engine import comps_table
     from src.services.wacc.peer_beta import peer_beta_wacc
-    from src.services.report.composer import compose as compose_report
+    from reports.composer import compose as compose_report
 
     try:
         model = build_model(ticker, force_refresh=False)
@@ -376,7 +466,8 @@ def download_report_md(
         except Exception:
             pass
 
-    from markdown import markdown as _md
+    fundamentals = _normalize_fundamentals_from_model(model) or fundamentals_fallback_fmp(ticker)
+
     md_text = compose_report({
         "symbol": ticker.upper(),
         "as_of": as_of or "latest",
@@ -385,7 +476,7 @@ def download_report_md(
         "target_low": "—",
         "target_high": "—",
         "base_currency": BASE_CURRENCY,
-        "fundamentals": model["core_financials"] if isinstance(model, dict) else getattr(model, "core_financials", {}),
+        "fundamentals": fundamentals or {},
         "dcf": (model.get("dcf_valuation") if isinstance(model, dict) else getattr(model, "dcf_valuation", None)),
         "valuation": {"wacc": (w or {}).get("wacc")},
         "comps": {"peers": (comps or {}).get("peers", [])},
